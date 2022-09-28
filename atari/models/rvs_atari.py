@@ -20,30 +20,44 @@ class RVS(nn.Module):
             nn.Conv2d(4, 32, 8, stride=4, padding=0), nn.ReLU(),
             nn.Conv2d(32, 64, 4, stride=2, padding=0), nn.ReLU(),
             nn.Conv2d(64, 64, 3, stride=1, padding=0), nn.ReLU(),
-            nn.Flatten(), nn.Linear(3136, self.n_embed), nn.Tanh()
+            nn.Flatten(), nn.Linear(3136, self.n_embed)
         )
 
-        self.ret_emb = nn.Sequential(nn.Linear(1, self.n_embed), nn.Tanh())
+        self.ret_emb = nn.Sequential(nn.Linear(1, self.n_embed))
 
-        layers = [nn.Linear(self.n_embed*2, hidden_size)] # input is concat of state and rtg
+        layers = [nn.LayerNorm(self.n_embed*2), nn.Linear(self.n_embed*2, hidden_size)] # input is concat of state and rtg
         for _ in range(n_layer-1):
             layers.extend([
-                nn.GELU(),
+                # nn.LayerNorm(hidden_size),
+                nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_size, hidden_size)
             ])
         layers.extend([
-            nn.GELU(),
+            # nn.LayerNorm(hidden_size),
+            nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, self.act_dim, bias=False),
+            nn.Linear(hidden_size, self.act_dim),
         ])
 
         self.model = nn.Sequential(*layers)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
     def forward(self, states, actions, rtg, reduction='mean'):
         state_emb = self.state_encoder(states)
         rtg_emb = self.ret_emb(rtg)
         inp = torch.cat((state_emb, rtg_emb), dim=-1)
+        # inp = torch.cat((state_emb, rtg), dim=-1)
         logits = self.model(inp)
         if actions is None:
             loss = None

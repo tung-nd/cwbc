@@ -26,8 +26,6 @@ from torch.nn import functional as F
 
 logger = logging.getLogger(__name__)
 
-import numpy as np
-
 class GELU(nn.Module):
     def forward(self, input):
         return F.gelu(input)

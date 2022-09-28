@@ -1,48 +1,48 @@
-from turtle import back
+import os
 import numpy as np
 import torch
-from scipy.stats import truncnorm
-import torch.nn as nn
 import math
-import logging
 
 from tqdm import tqdm
 import numpy as np
 
 import torch
-import torch.optim as optim
-from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.dataloader import DataLoader
 
-logger = logging.getLogger(__name__)
-
-from mingpt.utils import sample
 import atari_py
 from collections import deque
 import random
 import cv2
 import torch
-from PIL import Image
+import json
+
+from utils import get_logger, EXPERT_RETURN, RANDOM_RETURN, MAX_CONDITION_RETURN
 
 class RVSTrainer:
 
     def __init__(
-        self, model, game, train_dataset,
+        self, root, model, avg_reward, game, train_dataset, max_timesteps, min_rtg,
         max_epochs, batch_size, lr,
         conservative_level, conservative_return, conservative_w, max_return,
+        reweight_rtg,
         betas = (0.9, 0.95), decay=0.1,
         lr_decay=False, warmup_tokens=375e6,
         final_tokens=260e9, num_workers=0, seed=0
     ):
         # TODO: lr scheduler
+        self.root = root
         self.model = model
+        self.avg_reward = avg_reward
         self.game = game
         self.train_dataset = train_dataset
+        self.max_timesteps = max_timesteps
+        self.min_rtg = min_rtg
         self.max_epochs = max_epochs
         self.batch_size = batch_size
         self.conservative_return = conservative_return
         self.conservative_level = conservative_level
         self.conservative_w = conservative_w
+        self.reweight_rtg = reweight_rtg
         self.max_return = max_return
         self.lr = lr
         self.betas = betas
@@ -53,11 +53,58 @@ class RVSTrainer:
         self.num_workers = num_workers
         self.seed = seed
 
+        self.random_return = RANDOM_RETURN[game]
+        self.expert_return = EXPERT_RETURN[game]
+
         if torch.cuda.is_available():
             self.device = 'cuda'
             self.model = self.model.to(self.device)
 
-    def get_offset(self, traj_returns, device):
+    def configure_optimizers(self):
+        """
+        This long function is unfortunately doing something very simple and is being very defensive:
+        We are separating out all parameters of the model into two buckets: those that will experience
+        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
+        We are then returning the PyTorch optimizer object.
+        """
+
+        # separate out all parameters to those that will and won't experience regularizing weight decay
+        decay = set()
+        no_decay = set()
+        # whitelist_weight_modules = (torch.nn.Linear, )
+        whitelist_weight_modules = (torch.nn.Linear, torch.nn.Conv2d)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.BatchNorm1d, torch.nn.Embedding)
+        for mn, m in self.model.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
+
+                if pn.endswith('bias'):
+                    # all biases will not be decayed
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    # weights of whitelist modules will be weight decayed
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    # weights of blacklist modules will NOT be weight decayed
+                    no_decay.add(fpn)
+
+        # validate that we considered every parameter
+        param_dict = {pn: p for pn, p in self.model.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params), )
+
+        # create the pytorch optimizer object
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": self.decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(optim_groups, lr=self.lr, betas=self.betas)
+        return optimizer
+
+    def get_offset(self, traj_returns, timesteps, device):
         # augment with large offset for returns that are higher than conservative returns
         max_ids = torch.arange(traj_returns.shape[0])
         max_ids = max_ids[traj_returns >= self.conservative_return]
@@ -74,16 +121,16 @@ class RVSTrainer:
         offset = torch.zeros((num_augment, 1, 1), device=device).uniform_(0, max_noise) + min_noise
         offset = offset.float()
 
+        if self.avg_reward:
+            offset = offset / (self.max_timesteps - timesteps[max_ids] + 1)
+
         return max_ids, offset
 
     def train(self):
         model = self.model
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=self.lr,
-            betas=self.betas,
-            weight_decay=self.decay,
-        )
+        optimizer = self.configure_optimizers()
+
+        all_traj_returns = []
 
         def run_epoch(epoch_num=0):
             model.train(True)
@@ -94,14 +141,16 @@ class RVSTrainer:
             )
 
             pbar = tqdm(enumerate(loader), total=len(loader))
-            for it, (states, actions, rtgs, _, traj_returns) in pbar:
+            for it, (states, actions, rtgs, timesteps, traj_returns) in pbar:
+                all_traj_returns.extend(list(traj_returns.numpy().flatten()))
                 # place data on the correct device
                 states = states.to(self.device)
                 actions = actions.to(self.device)
                 rtgs = rtgs.to(self.device)
+                timesteps = timesteps.to(self.device)
 
                 if self.conservative_return is not None:
-                    max_ids, offset = self.get_offset(traj_returns, self.device)
+                    max_ids, offset = self.get_offset(traj_returns, timesteps, self.device)
                     if len(max_ids) > 0:
                         aug_states, aug_actions, aug_rtgs = states[max_ids], actions[max_ids], rtgs[max_ids] + offset
 
@@ -111,7 +160,8 @@ class RVSTrainer:
                 rtgs = rtgs.flatten(0, 1)
 
                 # forward the model
-                _, pred_loss = model(states.reshape(-1, 4, 84, 84).type(torch.float32).contiguous(), actions, rtgs, reduction='mean')
+                _, pred_loss = model(states.reshape(-1, 4, 84, 84).type(torch.float32).contiguous(), actions, rtgs, reduction='none')
+                pred_loss = torch.mean(pred_loss)
 
                 # conservative loss
                 if self.conservative_return is not None and len(max_ids) > 0:
@@ -120,8 +170,9 @@ class RVSTrainer:
                     aug_rtgs = aug_rtgs.flatten(0, 1)
                     _, conservative_loss = model(
                         aug_states.reshape(-1, 4, 84, 84).type(torch.float32).contiguous(),
-                        aug_actions, aug_rtgs, reduction='mean'
+                        aug_actions, aug_rtgs, reduction='none'
                     )
+                    conservative_loss = torch.mean(conservative_loss)
                     loss = pred_loss + self.conservative_w * conservative_loss
 
                 else:
@@ -156,38 +207,51 @@ class RVSTrainer:
 
         for epoch in range(self.max_epochs):
             run_epoch(epoch)
-            if self.game == 'Breakout':
-                eval_return = self.get_returns(90)
-            elif self.game == 'Seaquest':
-                rtgs = np.linspace(start=150, stop=1150, num=11)
-                eval_return = self.get_multiple_returns(rtgs)
-                # eval_return = self.get_returns(1150)
-            elif self.game == 'Qbert':
-                eval_return = self.get_returns(14000)
-            elif self.game == 'Pong':
-                eval_return = self.get_returns(20)
-            else:
-                raise NotImplementedError()
+            
+        rtgs = np.linspace(start=RANDOM_RETURN[self.game], stop=MAX_CONDITION_RETURN[self.game], num=20)
+        eval_returns = self.get_multiple_returns(rtgs)
+
+        return all_traj_returns
+
+    def normalize_return(self, ret):
+        return 100. * (ret - self.random_return) / (self.expert_return - self.random_return)
 
     def get_multiple_returns(self, list_ret):
+        self.model.train(False)
+
         returns = []
+        eval_results = {}
         for ret in list_ret:
-            returns.append(self.get_returns(ret))
+            r, eval_results = self.get_returns(ret, eval_results)
+            returns.append(r)
+
+        with open(os.path.join(self.root, 'eval_results.json'), 'w') as f:
+            json.dump(eval_results, f)
+
+        self.model.train(True)
+
         return returns
 
-    def get_returns(self, ret):
-        self.model.train(False)
+    def get_returns(self, ret, eval_results):
         args=Args(self.game.lower(), self.seed)
         env = Env(args)
         env.eval()
 
+        logfilename = os.path.join(self.root, 'eval.log')
+        logger = get_logger(logfilename, mode='a')
+
         T_rewards = []
+        normalized_rewards = []
         done = True
         for i in range(10):
             state = env.reset()
             state = state.type(torch.float32).to(self.device).unsqueeze(0)
             rtgs = torch.tensor([ret], dtype=torch.long).to(self.device).unsqueeze(0)
-            sampled_action = self.model.get_action(state.reshape(-1, 4, 84, 84).type(torch.float32).contiguous(), rtgs.float())
+            if self.avg_reward:
+                avg_rtgs = rtgs / (1 + self.max_timesteps)
+            else:
+                avg_rtgs = rtgs
+            sampled_action = self.model.get_action(state.reshape(-1, 4, 84, 84).type(torch.float32).contiguous(), avg_rtgs.float())
 
             j = 0
             while True:
@@ -200,18 +264,53 @@ class RVSTrainer:
 
                 if done:
                     T_rewards.append(reward_sum)
+                    normalized_rewards.append(self.normalize_return(reward_sum))
                     break
 
                 state = state.unsqueeze(0).unsqueeze(0).to(self.device)
                 rtgs = rtgs - reward # TODO: rvs update
 
-                sampled_action = self.model.get_action(state.reshape(-1, 4, 84, 84).type(torch.float32).contiguous(), rtgs.float())
+                timesteps = min(j, self.max_timesteps)
+                if self.avg_reward:
+                    avg_rtgs = rtgs / (1 + self.max_timesteps - timesteps)
+                else:
+                    avg_rtgs = rtgs
+
+                if self.game != 'Pong': # reset rtg to min_rtg if negative, except for Pong
+                    avg_rtgs = torch.maximum(avg_rtgs, torch.ones_like(avg_rtgs) * self.min_rtg)
+
+                sampled_action = self.model.get_action(state.reshape(-1, 4, 84, 84).type(torch.float32).contiguous(), avg_rtgs.float())
 
         env.close()
-        eval_return = sum(T_rewards)/10.
-        print("target return: %d, eval return: %d" % (ret, eval_return))
-        self.model.train(True)
-        return eval_return
+
+        T_rewards = np.array(T_rewards)
+        mean_return = np.mean(T_rewards)
+        std_return = np.std(T_rewards)
+
+        normalized_rewards = np.array(normalized_rewards)
+        norm_mean_return = np.mean(normalized_rewards)
+        norm_std_return = np.std(normalized_rewards)
+
+        eval_results[ret] = {}
+
+        logger.info(f'target_{ret}_unormalized_return_mean: : {mean_return}')
+        eval_results[ret]['unormalized_return_mean'] = mean_return
+        logger.info(f'target_{ret}_unormalized_return_std: {std_return}')
+        eval_results[ret]['unormalized_return_std'] = std_return
+
+        logger.info(f'target_{ret}_return_mean: : {norm_mean_return}')
+        eval_results[ret]['return_mean'] = norm_mean_return
+        logger.info(f'target_{ret}_return_std: {norm_std_return}')
+        eval_results[ret]['return_std'] = norm_std_return
+
+        logger.info("=" * 70)
+
+        handlers = logger.handlers[:]
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()
+
+        return mean_return, eval_results
 
 
 class Env():

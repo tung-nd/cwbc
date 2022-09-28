@@ -20,19 +20,16 @@ from tqdm import tqdm
 import numpy as np
 
 import torch
-import torch.optim as optim
-from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.dataloader import DataLoader
 
 logger = logging.getLogger(__name__)
 
-from mingpt.utils import sample
+from models.utils import sample
 import atari_py
 from collections import deque
 import random
 import cv2
 import torch
-from PIL import Image
 
 class TrainerConfig:
     # optimization parameters
@@ -89,7 +86,7 @@ class Trainer:
 
             losses = []
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
-            for it, (x, y, r, t, _) in pbar:
+            for it, (x, y, r, t, _, _) in pbar:
 
                 # place data on the correct device
                 x = x.to(self.device)

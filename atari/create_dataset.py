@@ -1,25 +1,9 @@
-import csv
-import logging
-# make deterministic
-from mingpt.utils import set_seed
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import math
-from torch.utils.data import Dataset
-from mingpt.model_atari import GPT, GPTConfig
-from mingpt.trainer_atari import Trainer, TrainerConfig
-from mingpt.utils import sample
-from collections import deque
-import random
-import torch
-import pickle
-import blosc
-import argparse
 from fixed_replay_buffer import FixedReplayBuffer
 
-def create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_per_buffer):
+from utils import EXPERT_RETURN, RANDOM_RETURN
+
+def create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_per_buffer, avg_reward=False, save_dir=None):
     # -- load data from memory (make more efficient)
     obss = []
     actions = []
@@ -73,6 +57,7 @@ def create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_p
             transitions_per_buffer[buffer_num] = i
         print('this buffer has %d loaded transitions and there are now %d transitions total divided into %d trajectories' % (i, len(obss), num_trajectories))
 
+    obss = np.array(obss)
     actions = np.array(actions)
     returns = np.array(returns)
     stepwise_returns = np.array(stepwise_returns)
@@ -88,15 +73,68 @@ def create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_p
             rtg_j = curr_traj_returns[j-start_index:i-start_index]
             rtg[j] = sum(rtg_j)
         start_index = i
-    print('max rtg is %d' % max(rtg))
+    max_rtg = max(rtg)
+    print('max rtg is %d' % max_rtg)
+    norm_max_rtg = 100. * (max_rtg - RANDOM_RETURN[game]) / (EXPERT_RETURN[game] - RANDOM_RETURN[game])
+    print('max normalized rtg is %f' % norm_max_rtg)
 
     # -- create timestep dataset
     start_index = 0
-    timesteps = np.zeros(len(actions)+1, dtype=int)
+    timesteps = np.zeros(len(actions), dtype=int)
     for i in done_idxs:
         i = int(i)
-        timesteps[start_index:i+1] = np.arange(i+1 - start_index)
-        start_index = i+1
+        timesteps[start_index:i] = np.arange(i - start_index)
+        start_index = i
     print('max timestep is %d' % max(timesteps))
 
-    return obss, actions, returns, done_idxs, rtg, timesteps
+    if avg_reward:
+        rtg = rtg / (1 + max(timesteps) - timesteps)
+
+    ### create list of trajectories
+    traj_obs, traj_actions, traj_rtgs, traj_timesteps = [], [], [], []
+    start_index = 0
+    for k, i in enumerate(done_idxs):
+        i = int(i)
+        traj_obs.append(obss[start_index:i])
+        traj_actions.append(actions[start_index:i])
+        traj_rtgs.append(rtg[start_index:i])
+        traj_timesteps.append(timesteps[start_index:i])
+        start_index = i
+
+    if save_dir is not None:
+        data = {
+            'obs': traj_obs,
+            'actions': traj_actions,
+            'rtgs': traj_rtgs,
+            'timesteps': traj_timesteps,
+            'returns': returns[:-1],
+            'max_timesteps': max(timesteps)
+        }
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        import pickle
+        with open(os.path.join(save_dir, f'{game.lower()}.pkl'), "wb") as f:
+            pickle.dump(data, f)
+
+    return traj_obs, traj_actions, returns[:-1], traj_rtgs, traj_timesteps, max(timesteps)
+
+import argparse
+parser = argparse.ArgumentParser()
+
+# general
+parser.add_argument('--data_dir_prefix', type=str, default='./dqn_replay/')
+parser.add_argument('--game', type=str, default='Breakout')
+parser.add_argument('--num_buffers', type=int, default=50)
+parser.add_argument('--trajectories_per_buffer', type=int, default=10, help='Number of trajectories to sample from each of the buffers.')
+parser.add_argument('--num_steps', type=int, default=500000)
+parser.add_argument('--avg_reward', action='store_true', default=False)
+parser.add_argument('--save_dir', type=str, default='./data_5e5')
+
+args = parser.parse_args()
+
+traj_obs, traj_actions, traj_returns, traj_rtgs, traj_timesteps, max_timesteps = create_dataset(
+    num_buffers=args.num_buffers, num_steps=args.num_steps,
+    game=args.game, data_dir_prefix=args.data_dir_prefix,
+    trajectories_per_buffer=args.trajectories_per_buffer,
+    avg_reward=args.avg_reward, save_dir=args.save_dir
+)
