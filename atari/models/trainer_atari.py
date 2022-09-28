@@ -86,13 +86,13 @@ class Trainer:
 
             losses = []
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
-            for it, (x, y, r, t, _, _) in pbar:
+            for it, (x, y, r, t, _) in pbar:
 
                 # place data on the correct device
                 x = x.to(self.device)
                 y = y.to(self.device)
                 r = r.to(self.device)
-                t = t.to(self.device)
+                t = t.to(self.device)[:, :1]
 
                 # forward the model
                 with torch.set_grad_enabled(is_train):
