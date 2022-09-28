@@ -1,0 +1,84 @@
+# experiment config
+defaults:
+  - override hydra/launcher: submitit_local
+expid: default
+seed: 0
+run_mode: train
+resume: null
+resume_dir: null
+root: ???
+tqdm: False
+
+### Environment and data config
+env: walker2d
+dataset: medium  # medium, medium-replay, medium-expert, expert
+dataset_dir: ${hydra:runtime.cwd}/data
+dataset_path: ${dataset_dir}/${env}-${dataset}-v2.pkl
+mode: normal  # normal for standard setting, delayed for sparse
+K: 20
+pct_traj: 1. # 0.1 for 10% BC
+batch_size: 64
+
+### Data reweighting
+reweight_rtg: False
+reweight_uniform: False
+bins: 20
+lamb: 0.01
+percentile: 0.9
+
+### Conservative
+conservative_percentile: null
+conservative_type: 'uniform'
+conservative_std: 1000
+conservative_level: ???
+conservative_min: null
+conservative_scale: False
+conservative_w: 1.0
+
+### Model config
+model_type: rvs
+use_a_hat: False # for dtmi only, if True use a_hat instead of a to compute CPC objective
+embed_dim: 1024
+n_layer: 2
+n_head: 1
+activation_function: relu
+dropout: 0.0
+
+### Training config
+avg_reward: True
+learning_rate: 1e-3
+weight_decay: 1e-4
+warmup_steps: 10000
+max_iters: 10
+num_steps_per_iter: 10000
+save_freq: 1
+device: cuda
+resume_job_id: 0 ### just a place holder
+
+### Performance evaluation
+num_eval_episodes: 10
+eval_expert_factor: 2
+eval_intervals: 20
+eval_min_target: 1000
+eval_max_target: ???
+interval: 200
+
+hydra:
+  run:
+    dir: ./exp/${now:%Y.%m.%d}/${now:%H%M%S}_${expid}
+  sweep:
+    dir: ./exp/${now:%Y.%m.%d}/${now:%H%M%S}_${expid}
+    subdir: ${hydra.job.num}
+  launcher:
+    timeout_min: 4300
+    cpus_per_task: 10
+    gpus_per_node: 1
+    tasks_per_node: 1
+    mem_gb: 160
+    nodes: 1
+    # constraint: volta32gb
+    submitit_folder: ./exp/${now:%Y.%m.%d}/${now:%H%M%S}_${expid}/slurm
+  job:
+    name: ${expid}
+    env_set:
+      CUDA_VISIBLE_DEVICES: "0"
