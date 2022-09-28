@@ -155,6 +155,10 @@ if args.model_type == 'rvs':
         conservative_return=conservative_return, conservative_level=conservative_level, conservative_w=conservative_w,
         reweight_rtg=args.reweight_rtg,
         max_return=sorted_returns[-1], num_workers=4, seed=args.seed)
+
+    all_traj_returns = trainer.train()
+    all_traj_returns = np.array(all_traj_returns).flatten()
+    draw_hist(all_traj_returns, args.game, args.bins, os.path.join(root, 'hist_training'))
 else:
     if args.model_type == 'dt':
         model_type = 'reward_conditioned'
@@ -172,6 +176,4 @@ else:
                         num_workers=4, seed=args.seed, model_type=model_type, game=args.game, max_timestep=max_timesteps)
     trainer = Trainer(model, train_dataset, None, tconf)
 
-all_traj_returns = trainer.train()
-all_traj_returns = np.array(all_traj_returns).flatten()
-draw_hist(all_traj_returns, args.game, args.bins, os.path.join(root, 'hist_training'))
+    trainer.train()
