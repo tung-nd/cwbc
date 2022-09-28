@@ -84,11 +84,13 @@ def evaluate_episode_rvs(
         act_dim,
         model,
         max_ep_len=1000,
+        scale=1000,
         device='cuda',
         target_return=None,
         mode='normal',
         state_mean=0.,
         state_std=1.,
+        avg_reward=True
 ):
 
     model.eval()
@@ -103,7 +105,12 @@ def evaluate_episode_rvs(
     # we keep all the histories on the device
     # note that the latest action and reward will be "padding"
     state = torch.from_numpy(state).reshape(1, state_dim).to(device=device, dtype=model_dtype)
+
     target_return = torch.from_numpy(np.array(target_return)).reshape(1, 1).to(device=device, dtype=model_dtype)
+    if avg_reward:
+        target_return = target_return / max_ep_len
+    else:
+        target_return = target_return / scale
 
     episode_return, episode_length = 0, 0
     for t in range(max_ep_len):
@@ -122,7 +129,10 @@ def evaluate_episode_rvs(
 
         # update state and rtg
         state = torch.from_numpy(state).to(device=device, dtype=model_dtype).reshape(1, state_dim)
-        target_return = ((max_ep_len-t)*target_return - reward) / (max_ep_len - t - 1)
+        if avg_reward:
+            target_return = ((max_ep_len-t)*target_return - reward) / (max_ep_len - t - 1)
+        else:
+            target_return = target_return - reward/scale
         target_return = target_return.to(dtype=model_dtype)
 
         episode_return += reward
@@ -147,7 +157,8 @@ def evaluate_episode_rtg(
         target_return=None,
         mode='normal',
         init_state=None,
-        return_actions=False
+        return_actions=False,
+        avg_reward=False
     ):
 
     model.eval()
@@ -168,6 +179,10 @@ def evaluate_episode_rtg(
 
     ep_return = target_return
     target_return = torch.tensor(ep_return, device=device, dtype=torch.float32).reshape(1, 1)
+    if avg_reward:
+        target_return = target_return / max_ep_len
+    else:
+        target_return = target_return / scale
     timesteps = torch.tensor(0, device=device, dtype=torch.long).reshape(1, 1)
 
     sim_states = []
@@ -196,7 +211,10 @@ def evaluate_episode_rtg(
         rewards[-1] = reward
 
         if mode != 'delayed':
-            pred_return = target_return[0,-1] - (reward/scale)
+            if avg_reward:
+                pred_return = ((max_ep_len-t)*target_return[0,-1] - reward) / (max_ep_len - t - 1)
+            else:
+                pred_return = target_return[0,-1] - (reward/scale)
         else:
             pred_return = target_return[0,-1]
         target_return = torch.cat(

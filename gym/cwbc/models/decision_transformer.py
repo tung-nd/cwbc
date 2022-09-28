@@ -21,11 +21,15 @@ class DecisionTransformer(TrajectoryModel):
             max_length=None,
             max_ep_len=4096,
             action_tanh=True,
+            concat_state_rtg=False,
+            avg_reward=False,
             **kwargs
     ):
         super().__init__(state_dim, act_dim, max_length=max_length)
 
         self.hidden_size = hidden_size
+        self.concat_state_rtg = concat_state_rtg
+        self.avg_reward = avg_reward
         config = transformers.GPT2Config(
             vocab_size=1,  # doesn't matter -- we don't use the vocab
             n_embd=hidden_size,
@@ -36,10 +40,16 @@ class DecisionTransformer(TrajectoryModel):
         # is that the positional embeddings are removed (since we'll add those ourselves)
         self.transformer = GPT2Model(config)
 
-        self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
-        self.embed_return = torch.nn.Linear(1, hidden_size)
-        self.embed_state = torch.nn.Linear(self.state_dim, hidden_size)
         self.embed_action = torch.nn.Linear(self.act_dim, hidden_size)
+
+        if concat_state_rtg:
+            self.embed_state_rtg = torch.nn.Linear(self.state_dim+1, hidden_size)
+        else:
+            self.embed_return = torch.nn.Linear(1, hidden_size)
+            self.embed_state = torch.nn.Linear(self.state_dim, hidden_size)
+
+        if not avg_reward: # only need time emb if use sum formulation
+            self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
 
         self.embed_ln = nn.LayerNorm(hidden_size)
 
@@ -61,27 +71,32 @@ class DecisionTransformer(TrajectoryModel):
             attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
 
         # embed each modality with a different head
-        state_embeddings = self.embed_state(states)
         action_embeddings = self.embed_action(actions)
-        returns_embeddings = self.embed_return(returns_to_go)
-        time_embeddings = self.embed_timestep(timesteps)
+        list_embeddings = []
 
-        # time embeddings are treated similar to positional embeddings
-        state_embeddings = state_embeddings + time_embeddings
-        action_embeddings = action_embeddings + time_embeddings
-        returns_embeddings = returns_embeddings + time_embeddings
+        if self.concat_state_rtg:
+            state_rtg_embeddings = self.embed_state_rtg(torch.cat((states, returns_to_go), dim=-1))
+            list_embeddings = [state_rtg_embeddings, action_embeddings]
+        else:
+            state_embeddings = self.embed_state(states)
+            returns_embeddings = self.embed_return(returns_to_go)
+            list_embeddings = [returns_embeddings, state_embeddings, action_embeddings]
+
+        if not self.avg_reward:
+            time_embeddings = self.embed_timestep(timesteps)
+            list_embeddings = [emb + time_embeddings for emb in list_embeddings]
 
         # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
         # which works nice in an autoregressive sense since states predict actions
         stacked_inputs = torch.stack(
-            (returns_embeddings, state_embeddings, action_embeddings), dim=1
-        ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
+            list_embeddings, dim=1
+        ).permute(0, 2, 1, 3).reshape(batch_size, len(list_embeddings)*seq_length, self.hidden_size)
         stacked_inputs = self.embed_ln(stacked_inputs)
 
         # to make the attention mask fit the stacked inputs, have to stack it as well
         stacked_attention_mask = torch.stack(
-            (attention_mask, attention_mask, attention_mask), dim=1
-        ).permute(0, 2, 1).reshape(batch_size, 3*seq_length)
+            [attention_mask, ] * len(list_embeddings), dim=1
+        ).permute(0, 2, 1).reshape(batch_size, len(list_embeddings)*seq_length)
 
         # we feed in the input embeddings (not word indices as in NLP) to the model
         transformer_outputs = self.transformer(
@@ -93,12 +108,19 @@ class DecisionTransformer(TrajectoryModel):
 
         # reshape x so that the second dimension corresponds to the original
         # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
-        x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
+        # x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
+        x = x.reshape(batch_size, seq_length, len(list_embeddings), self.hidden_size).permute(0, 2, 1, 3)
 
         # get predictions
-        return_preds = self.predict_return(x[:,2])  # predict next return given state and action
-        state_preds = self.predict_state(x[:,2])    # predict next state given state and action
-        action_preds = self.predict_action(x[:,1])  # predict next action given state
+        if self.concat_state_rtg:
+            return_preds = self.predict_return(x[:,1])  # predict next return given state and action
+            state_preds = self.predict_state(x[:,1])    # predict next state given state and action
+            action_preds = self.predict_action(x[:,0])  # predict next action given state
+            transformer_outputs['state_rtg_embeddings'] = state_rtg_embeddings
+        else:
+            return_preds = self.predict_return(x[:,2])  # predict next return given state and action
+            state_preds = self.predict_state(x[:,2])    # predict next state given state and action
+            action_preds = self.predict_action(x[:,1])  # predict next action given state
 
         if output_attentions:
             return state_preds, action_preds, return_preds, transformer_outputs

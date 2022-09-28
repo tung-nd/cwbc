@@ -367,7 +367,7 @@ def evaluate(variant, env_targets):
                         model,
                         max_ep_len=max_ep_len,
                         scale=scale,
-                        target_return=target/scale,
+                        target_return=target,
                         mode=mode,
                         state_mean=state_mean,
                         state_std=state_std,
@@ -380,11 +380,13 @@ def evaluate(variant, env_targets):
                         act_dim,
                         model,
                         max_ep_len=max_ep_len,
-                        target_return=target/max_ep_len,
+                        scale=scale,
+                        target_return=target,
                         mode=mode,
                         state_mean=state_mean,
                         state_std=state_std,
                         device=device,
+                        avg_reward=variant['avg_reward']
                     )
                 else:
                     ret, length = evaluate_episode(

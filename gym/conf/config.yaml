@@ -37,7 +37,7 @@ conservative_w: 1.0
 
 ### Model config
 model_type: rvs
-use_a_hat: False # for dtmi only, if True use a_hat instead of a to compute CPC objective
+concat_state_rtg: False # for dt
 embed_dim: 1024
 n_layer: 2
 n_head: 1

@@ -75,6 +75,8 @@ def create_model(model_type, state_dim, act_dim, K, max_ep_len, variant):
             n_positions=1024,
             resid_pdrop=variant["dropout"],
             attn_pdrop=variant["dropout"],
+            concat_state_rtg=variant["concat_state_rtg"],
+            avg_reward=variant["avg_reward"]
         )
     elif model_type in ["bc", "rvs"]:
         model = class_model(
